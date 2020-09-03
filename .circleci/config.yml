@@ -3,7 +3,7 @@
 version: 2
 
 jobs:
-  unittests:
+  cargotest:
     docker:
       - image: circleci/rust:1.46.0
     steps:
@@ -36,6 +36,6 @@ jobs:
 
 workflows:
   version: 2
-  check_formating:
+  unit_tests:
     jobs:
-      - unittests
+      - cargotest
