@@ -27,12 +27,9 @@ jobs:
             - target/debug/build
             - target/debug/deps
           key: v4-cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
-      - run: |
-          # tell the operating system to remove the memlock limit
-          sudo ulimit -l unlimited
       - run:
           name: Run all tests
-          command: cargo test --all
+          command: cargo test --all --test-threads 1
 
 workflows:
   version: 2
