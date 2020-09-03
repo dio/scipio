@@ -441,3 +441,174 @@ impl DmaFile {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{LocalExecutor, DmaFile, DmaBuffer};
+    use std::path::PathBuf;
+
+    fn make_test_directory(test_name: &str) -> PathBuf {
+        // Scipio currently only supports NVMe-backed volumes formatted with XFS or EXT4.
+        // We therefore can't use the system-provided tmpfs for our test so instead we let the user
+        // decide what directory scipio should use to perform integration tests.
+        // For more information regarding this limitation, see the README
+        let p = std::env::var("SCIPIO_TESTROOTDIR").expect("SCIPIO_TESTDIR is not part of the ENV");
+
+        let mut dir = PathBuf::from(p);
+        std::assert!(dir.exists());
+
+        dir.push(test_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_create_close() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let mut path = make_test_directory("io_file_create_close");
+        path.push("testfile");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(&path).await.expect("failed to create file");
+            new_file.close().await.expect("failed to close newly created file");
+        });
+
+        std::assert!(path.exists());
+    }
+
+    #[test]
+    fn file_open() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let mut path = make_test_directory("io_file_create_close");
+        path.push("testfile");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(&path).await.expect("failed to create file");
+            new_file.close().await.expect("failed to close newly created file");
+
+            let mut file = DmaFile::open(&path).await.expect("failed to open file");
+            file.close().await.expect("failed to close newly created file");
+        });
+
+        std::assert!(path.exists());
+    }
+
+    #[test]
+    fn file_rename() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let root_path = make_test_directory("io_file_rename");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(root_path.join("testfile")).await.expect("failed to create file");
+
+            new_file.rename(root_path.join("testfile2")).await.expect("failed to rename file");
+
+            std::assert!(!root_path.join("testfile").exists());
+            std::assert!(root_path.join("testfile2").exists());
+
+            new_file.close().await.expect("failed to close newly created file");
+        });
+
+    }
+
+    #[test]
+    fn file_allocate() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let root_path = make_test_directory("io_file_allocate");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(root_path.join("testfile")).await.expect("failed to create file");
+
+            new_file.pre_allocate(4096).await.expect("fallocate failed");
+            std::assert_eq!(new_file.file_size().await.unwrap(), 4096, "file doesn't have expected size");
+            let metadata = std::fs::metadata(root_path.join("testfile")).unwrap();
+            std::assert_eq!(metadata.len(), 4096);
+
+            // should be noop
+            new_file.pre_allocate(2048).await.expect("fallocate failed");
+
+            std::assert_eq!(new_file.file_size().await.unwrap(), 4096, "file doesn't have expected size");
+            let metadata = std::fs::metadata(root_path.join("testfile")).unwrap();
+            std::assert_eq!(metadata.len(), 4096);
+
+            new_file.close().await.expect("failed to close newly created file");
+        });
+    }
+
+    #[test]
+    fn file_allocate_zero() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let root_path = make_test_directory("io_file_allocate_zero");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(root_path.join("testfile")).await.expect("failed to create file");
+            new_file.pre_allocate(0).await.expect_err("fallocate should fail with len == 0");
+
+            new_file.close().await.expect("failed to close file");
+        });
+    }
+
+    #[test]
+    fn file_align_up_down() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let root_path = make_test_directory("io_file_align_up_down");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(root_path.join("testfile")).await.expect("failed to create file");
+
+            // assume 4KiB alignment
+            assert_eq!(new_file.align_up(0), 0);
+            assert_eq!(new_file.align_down(0), 0);
+            assert_eq!(new_file.align_up(1), 4096);
+            assert_eq!(new_file.align_down(1), 0);
+            assert_eq!(new_file.align_up(4096), 4096);
+            assert_eq!(new_file.align_down(4096), 4096);
+
+            new_file.close().await.expect("failed to close file");
+        });
+    }
+
+    #[test]
+    fn file_simple_readwrite() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let root_path = make_test_directory("io_file_simple_readwrite");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(root_path.join("testfile")).await.expect("failed to create file");
+
+            let buf = DmaBuffer::new(4096).expect("failed to allocate dma buffer");
+            for i in buf.as_mut_bytes() {
+                *i = 42
+            }
+            new_file.write_dma(&buf, 0).await.expect("failed to write");
+
+            let read_buf = new_file.read_dma(0, 500).await.expect("failed to read");
+            std::assert_eq!(read_buf.len(), 500);
+            for i in 0..read_buf.len() {
+                std::assert_eq!(read_buf.as_bytes()[i], buf.as_bytes()[i]);
+            }
+
+            let read_buf = new_file.read_dma_aligned(0, 4096).await.expect("failed to read");
+            std::assert_eq!(read_buf.len(), 4906);
+            for i in 0..read_buf.len() {
+                std::assert_eq!(read_buf.as_bytes()[i], buf.as_bytes()[i]);
+            }
+
+            new_file.close().await.expect("failed to close file");
+        });
+    }
+
+    #[test]
+    fn file_invalid_read() {
+        let ex = LocalExecutor::new(None).unwrap();
+        let root_path = make_test_directory("io_file_simple_invalid_read");
+
+        ex.run(async {
+            let mut new_file = DmaFile::create(root_path.join("testfile")).await.expect("read should fail");
+            new_file.read_dma(0, 512).await.expect_err("failed to read");
+
+            new_file.close().await.expect("failed to close file");
+        });
+    }
+}
